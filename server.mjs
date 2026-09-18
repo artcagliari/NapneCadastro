@@ -32,9 +32,11 @@ const seed = [
   { id:'NAP-2026-038',nome:'João Pedro Nascimento',cpf:'625.***.***-70',cpfRaw:'62590481370',nascimento:'1992-09-08',email:'joao.nascimento@escola.edu.br',telefone:'(61) 99632-4418',sexo:'Masculino',raca:'Parda',nacionalidade:'Brasileira',cidadeNascimento:'Formosa',ufNascimento:'GO',cep:'72801-015',cidade:'Formosa',uf:'GO',zona:'Rural',escolaridade:'Educação superior',curso:'Psicologia',instituicao:'Centro Universitário de Brasília',conclusao:'2017',pos:'Psicopedagogia',funcao:'Psicopedagogo(a)',carga:'20h',vinculo:'Contrato CLT',cursos:['Educação especial','Gestão escolar'],status:'Completo',criadoEm:'2026-08-25T16:30:00' }
 ]
 
-await mkdir(dataDir, { recursive: true })
-if (!existsSync(recordsFile)) await writeFile(recordsFile, JSON.stringify(seed, null, 2))
-if (!existsSync(studentsFile)) await writeFile(studentsFile, '[]')
+if (!supabaseEnabled) {
+  await mkdir(dataDir, { recursive: true })
+  if (!existsSync(recordsFile)) await writeFile(recordsFile, JSON.stringify(seed, null, 2))
+  if (!existsSync(studentsFile)) await writeFile(studentsFile, '[]')
+}
 const readRecords = async () => {
   if (!supabaseAdmin) return JSON.parse(await readFile(recordsFile, 'utf8'))
   const { data, error } = await supabaseAdmin.from('profissionais').select('*').order('criado_em', { ascending:false })
@@ -60,16 +62,27 @@ const saveStudents = async students => {
   if (error) throw error
 }
 const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(v => v.trim().split('=').map(decodeURIComponent)))
-const authorized = req => { const session = sessions.get(cookies(req).napne_session); return session && session.expires > Date.now() }
+const authorized = async req => {
+  const token = cookies(req).napne_session
+  if (!token) return false
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin.auth.getUser(token)
+    return !error && data.user?.email?.trim().toLowerCase() === adminEmail.trim().toLowerCase()
+  }
+  const session = sessions.get(token)
+  return Boolean(session && session.expires > Date.now())
+}
 const passwordMatches = candidate => {
   const salt = 'conecta-napne-admin'
   return timingSafeEqual(scryptSync(candidate, salt, 32), scryptSync(adminPassword, salt, 32))
 }
 const authenticateAdmin = async (email, password) => {
-  if (email !== adminEmail) return false
-  if (!supabaseAuth) return passwordMatches(password)
-  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password })
-  return !error && data.user?.email === adminEmail
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+  if (normalizedEmail !== adminEmail.trim().toLowerCase()) return null
+  if (!supabaseAuth) return passwordMatches(password) ? { token:null } : null
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email:normalizedEmail, password })
+  if (error || data.user?.email?.toLowerCase() !== normalizedEmail) return null
+  return { token:data.session?.access_token || null }
 }
 
 if (supabaseAdmin) {
@@ -109,20 +122,21 @@ app.post('/api/cadastros', async (req,res) => {
 })
 
 app.post('/api/admin/login', async (req,res) => {
-  if (!await authenticateAdmin(req.body.email, String(req.body.password || ''))) return res.status(401).json({ error:'E-mail ou senha incorretos.' })
-  const token = randomBytes(32).toString('hex')
-  sessions.set(token, { expires:Date.now() + 8 * 60 * 60 * 1000 })
+  const authentication = await authenticateAdmin(req.body.email, String(req.body.password || ''))
+  if (!authentication) return res.status(401).json({ error:'E-mail ou senha incorretos.' })
+  const token = authentication.token || randomBytes(32).toString('hex')
+  if (!authentication.token) sessions.set(token, { expires:Date.now() + 8 * 60 * 60 * 1000 })
   const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'
   res.setHeader('Set-Cookie', `napne_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure?'; Secure':''}`)
   res.json({ ok:true })
 })
-app.get('/api/admin/session', (req,res) => res.json({ authenticated:Boolean(authorized(req)) }))
+app.get('/api/admin/session', async (req,res) => res.json({ authenticated:await authorized(req) }))
 app.post('/api/admin/logout', (req,res) => { sessions.delete(cookies(req).napne_session); res.setHeader('Set-Cookie','napne_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); res.json({ok:true}) })
-app.get('/api/admin/cadastros', async (req,res) => authorized(req) ? res.json(await readRecords()) : res.status(401).json({error:'Não autorizado.'}))
+app.get('/api/admin/cadastros', async (req,res) => await authorized(req) ? res.json(await readRecords()) : res.status(401).json({error:'Não autorizado.'}))
 
-app.get('/api/admin/alunos', async (req,res) => authorized(req) ? res.json(await readStudents()) : res.status(401).json({error:'Não autorizado.'}))
+app.get('/api/admin/alunos', async (req,res) => await authorized(req) ? res.json(await readStudents()) : res.status(401).json({error:'Não autorizado.'}))
 app.post('/api/admin/alunos', async (req,res) => {
-  if (!authorized(req)) return res.status(401).json({ error:'Não autorizado.' })
+  if (!await authorized(req)) return res.status(401).json({ error:'Não autorizado.' })
   const required = ['codigoEscola','nome','nascimento','sexo','raca','nacionalidade','paisResidencia','ufResidencia','municipioResidencia','zona','turma','etapa']
   if (required.some(key => !String(req.body[key] || '').trim())) return res.status(400).json({ error:'Preencha todos os campos obrigatórios do aluno.' })
   if (req.body.cpf && !isValidCpf(req.body.cpf)) return res.status(400).json({ error:'Informe um CPF válido, usando apenas números.' })
@@ -145,16 +159,20 @@ app.post('/api/admin/alunos', async (req,res) => {
   res.status(201).json(student)
 })
 
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(root, 'dist')))
-  app.get('*path', (_,res) => res.sendFile(path.join(root, 'dist', 'index.html')))
-} else {
-  const { createServer } = await import('vite')
-  const vite = await createServer({ server:{ middlewareMode:true }, appType:'spa' })
-  app.use(vite.middlewares)
+if (!process.env.VERCEL) {
+  if (process.env.NODE_ENV === 'production') {
+    app.use(express.static(path.join(root, 'dist')))
+    app.get('*path', (_,res) => res.sendFile(path.join(root, 'dist', 'index.html')))
+  } else {
+    const { createServer } = await import('vite')
+    const vite = await createServer({ server:{ middlewareMode:true }, appType:'spa' })
+    app.use(vite.middlewares)
+  }
+
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Conecta NAPNE disponível em http://localhost:${port}`)
+    console.log(`Persistência: ${supabaseEnabled ? 'Supabase' : 'arquivos locais (configure SUPABASE_SERVICE_ROLE_KEY para ativar o Supabase)'}`)
+  })
 }
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Conecta NAPNE disponível em http://localhost:${port}`)
-  console.log(`Persistência: ${supabaseEnabled ? 'Supabase' : 'arquivos locais (configure SUPABASE_SERVICE_ROLE_KEY para ativar o Supabase)'}`)
-})
+export default app
