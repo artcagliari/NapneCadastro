@@ -1,5 +1,5 @@
 import express from 'express'
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -24,6 +24,9 @@ const supabaseOptions = { auth:{ persistSession:false, autoRefreshToken:false, d
 const supabaseAdmin = supabaseEnabled ? createClient(supabaseUrl, supabaseServiceKey, supabaseOptions) : null
 const supabaseAuth = supabaseEnabled ? createClient(supabaseUrl, supabaseAnonKey, supabaseOptions) : null
 const sessions = new Map()
+const localLoginLimits = new Map()
+const loginWindowMs = 15 * 60 * 1000
+let adminUserId = null
 
 const seed = [
   { id:'NAP-2026-041',nome:'Mariana Alves da Silva',cpf:'482.***.***-09',cpfRaw:'48297136809',nascimento:'1990-06-14',email:'mariana.alves@escola.edu.br',telefone:'(61) 99842-1160',sexo:'Feminino',raca:'Parda',nacionalidade:'Brasileira',cidadeNascimento:'Goiânia',ufNascimento:'GO',cep:'70680-120',cidade:'Brasília',uf:'DF',zona:'Urbana',escolaridade:'Educação superior',curso:'Pedagogia',instituicao:'Universidade de Brasília',conclusao:'2014',pos:'Psicopedagogia',funcao:'Psicopedagogo(a)',carga:'40h',vinculo:'Concursado/efetivo/estável',cursos:['Educação especial','Educação em direitos humanos'],status:'Completo',criadoEm:'2026-08-29T10:20:00' },
@@ -84,13 +87,65 @@ const authenticateAdmin = async (email, password) => {
   if (error || data.user?.email?.toLowerCase() !== normalizedEmail) return null
   return { token:data.session?.access_token || null }
 }
+const loginLimitContext = req => {
+  const email = String(req.body?.email || '').trim().toLowerCase()
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+  const ip = forwarded || req.ip || req.socket?.remoteAddress || 'unknown'
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  return { targetsAdmin:email === adminEmail.trim().toLowerCase(), keys:[{ key:hash(`email:${email}`), max:5 }, { key:hash(`ip:${ip}`), max:20 }] }
+}
+const loginLimitStatus = async context => {
+  if (supabaseAdmin && context.targetsAdmin && adminUserId) {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(adminUserId)
+    if (error) throw error
+    const limit = data.user?.app_metadata?.napne_login_limit
+    const remaining = Number(limit?.blockedUntil || 0) - Date.now()
+    return { allowed:remaining <= 0, retryAfter:Math.max(0, Math.ceil(remaining / 1000)) }
+  }
+  const now = Date.now()
+  const blocked = context.keys.map(({key}) => localLoginLimits.get(key)).filter(item => item?.blockedUntil > now)
+  return { allowed:blocked.length === 0, retryAfter:Math.ceil(Math.max(0, ...blocked.map(item => item.blockedUntil - now)) / 1000) }
+}
+const registerLoginFailure = async context => {
+  if (supabaseAdmin && context.targetsAdmin && adminUserId) {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(adminUserId)
+    if (error) throw error
+    const now = Date.now(), current = data.user?.app_metadata?.napne_login_limit
+    const fresh = !current || Number(current.windowStarted) <= now - loginWindowMs
+    const attempts = fresh ? 1 : Number(current.attempts || 0) + 1
+    const limit = { attempts, windowStarted:fresh ? now : Number(current.windowStarted), blockedUntil:attempts >= 5 ? now + loginWindowMs : Number(current?.blockedUntil || 0) }
+    const { error:updateError } = await supabaseAdmin.auth.admin.updateUserById(adminUserId, { app_metadata:{ ...data.user.app_metadata, napne_login_limit:limit } })
+    if (updateError) throw updateError
+    return
+  }
+  const now = Date.now()
+  context.keys.forEach(({key,max}) => {
+    const current = localLoginLimits.get(key)
+    const fresh = !current || current.windowStarted <= now - loginWindowMs
+    const attempts = fresh ? 1 : current.attempts + 1
+    localLoginLimits.set(key, { attempts, windowStarted:fresh ? now : current.windowStarted, blockedUntil:attempts >= max ? now + loginWindowMs : current?.blockedUntil || 0 })
+  })
+}
+const clearLoginFailures = async context => {
+  if (supabaseAdmin && context.targetsAdmin && adminUserId) {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(adminUserId)
+    if (error) throw error
+    const { error:updateError } = await supabaseAdmin.auth.admin.updateUserById(adminUserId, { app_metadata:{ ...data.user.app_metadata, napne_login_limit:null } })
+    if (updateError) throw updateError
+    return
+  }
+  context.keys.forEach(({key}) => localLoginLimits.delete(key))
+}
 
 if (supabaseAdmin) {
   const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page:1, perPage:1000 })
   if (error) throw new Error(`Não foi possível consultar usuários no Supabase: ${error.message}`)
-  if (!data.users.some(user => user.email === adminEmail)) {
-    const { error:createError } = await supabaseAdmin.auth.admin.createUser({ email:adminEmail, password:adminPassword, email_confirm:true })
+  const existingAdmin = data.users.find(user => user.email === adminEmail)
+  if (existingAdmin) adminUserId = existingAdmin.id
+  else {
+    const { data:createData, error:createError } = await supabaseAdmin.auth.admin.createUser({ email:adminEmail, password:adminPassword, email_confirm:true })
     if (createError) throw new Error(`Não foi possível criar o administrador no Supabase: ${createError.message}`)
+    adminUserId = createData.user.id
   }
 }
 
@@ -105,7 +160,7 @@ app.post('/api/cadastros', async (req,res) => {
   if (req.body.escolaridade === 'Educação superior' && !String(req.body.cursosSuperiores?.[0]?.curso || req.body.curso || '').trim()) return res.status(400).json({ error:'Informe ao menos um curso superior.' })
   if (req.body.ifa === 'Sim' && !String(req.body.areaIfa || '').trim()) return res.status(400).json({ error:'Informe a área do IFA.' })
   if (req.body.iftp === 'Sim' && !String(req.body.areaIftp || '').trim()) return res.status(400).json({ error:'Informe a área do IFTP.' })
-  if (!isValidCpf(req.body.cpf)) return res.status(400).json({ error:'Informe um CPF válido, usando apenas números.' })
+  if (!isValidCpf(req.body.cpf)) return res.status(400).json({ error:'Informe um CPF válido.' })
   if (!isValidEmail(req.body.email)) return res.status(400).json({ error:'Informe um e-mail válido.' })
   if (!isValidPhone(req.body.telefone)) return res.status(400).json({ error:'Informe um celular válido com DDD.' })
   if (!isValidCep(req.body.cep) || !/^[A-Za-z]{2}$/.test(req.body.uf)) return res.status(400).json({ error:'Informe um CEP e uma UF válidos.' })
@@ -122,8 +177,18 @@ app.post('/api/cadastros', async (req,res) => {
 })
 
 app.post('/api/admin/login', async (req,res) => {
+  const limitContext = loginLimitContext(req)
+  const limit = await loginLimitStatus(limitContext)
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfter))
+    return res.status(429).json({ error:'Muitas tentativas de login. Aguarde alguns minutos e tente novamente.' })
+  }
   const authentication = await authenticateAdmin(req.body.email, String(req.body.password || ''))
-  if (!authentication) return res.status(401).json({ error:'E-mail ou senha incorretos.' })
+  if (!authentication) {
+    await registerLoginFailure(limitContext)
+    return res.status(401).json({ error:'E-mail ou senha incorretos.' })
+  }
+  await clearLoginFailures(limitContext)
   const token = authentication.token || randomBytes(32).toString('hex')
   if (!authentication.token) sessions.set(token, { expires:Date.now() + 8 * 60 * 60 * 1000 })
   const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'
@@ -139,7 +204,7 @@ app.post('/api/admin/alunos', async (req,res) => {
   if (!await authorized(req)) return res.status(401).json({ error:'Não autorizado.' })
   const required = ['codigoEscola','nome','nascimento','sexo','raca','nacionalidade','paisResidencia','ufResidencia','municipioResidencia','zona','turma','etapa']
   if (required.some(key => !String(req.body[key] || '').trim())) return res.status(400).json({ error:'Preencha todos os campos obrigatórios do aluno.' })
-  if (req.body.cpf && !isValidCpf(req.body.cpf)) return res.status(400).json({ error:'Informe um CPF válido, usando apenas números.' })
+  if (req.body.cpf && !isValidCpf(req.body.cpf)) return res.status(400).json({ error:'Informe um CPF válido.' })
   if (req.body.cep && !isValidCep(req.body.cep)) return res.status(400).json({ error:'Informe um CEP válido.' })
   if (!/^[A-Za-z]{2}$/.test(req.body.ufResidencia)) return res.status(400).json({ error:'Informe uma UF de residência válida.' })
   if (Number.isNaN(Date.parse(req.body.nascimento)) || new Date(req.body.nascimento) >= new Date()) return res.status(400).json({ error:'Informe uma data de nascimento válida.' })

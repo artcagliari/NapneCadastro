@@ -30,9 +30,11 @@ test('exibe filiação, povo indígena, formações repetíveis e itinerários',
   await page.goto('/#cadastro')
   await page.getByLabel('Nome completo*').fill('Teste da Silva')
   await page.getByLabel('CPF*').fill('52998224725')
+  await expect(page.getByLabel('CPF*')).toHaveValue('529.982.247-25')
   await page.getByLabel('Data de nascimento*').fill('1990-01-10')
   await page.getByLabel('E-mail*').fill('teste@exemplo.com')
   await page.getByLabel('Telefone / WhatsApp*').fill('(61) 99999-9999')
+  await expect(page.getByLabel('Telefone / WhatsApp*')).toHaveValue('(61) 99999-9999')
   await page.getByLabel('Nome completo da filiação 1').fill('Maria da Silva')
   await page.locator('label.choice').filter({ hasText: /^Masculino$/ }).click()
   await page.locator('label.choice').filter({ hasText: /^Indígena$/ }).click()
@@ -84,7 +86,7 @@ test('habilita profissionais, relatórios e questionário do aluno no painel', a
   await page.getByRole('button', { name: /Questionário do aluno/ }).click()
   await expect(page.getByRole('heading', { name: 'Cadastrar aluno(a)' })).toBeVisible()
   await expect(page.getByLabel('Código da escola*')).toBeVisible()
-  await expect(page.getByLabel('CPF (somente números)')).toBeVisible()
+  await expect(page.getByLabel('CPF')).toBeVisible()
 })
 
 test('valida cpf, e-mail e celular no cadastro profissional', async ({ page }) => {
