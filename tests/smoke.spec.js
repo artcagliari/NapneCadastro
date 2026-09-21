@@ -1,5 +1,13 @@
 import { expect, test } from '@playwright/test'
 
+const loginAdmin = async page => {
+  await expect(page.getByLabel('E-mail')).toHaveValue('')
+  await expect(page.getByLabel('Senha', { exact: true })).toHaveValue('')
+  await page.getByLabel('E-mail').fill('admin@napne.gov.br')
+  await page.getByLabel('Senha', { exact: true }).fill('admin123')
+  await page.getByRole('button', { name: /Entrar no painel/ }).click()
+}
+
 test('abre o cadastro público', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: /Quem acolhe/ })).toBeVisible()
@@ -10,7 +18,7 @@ test('abre o cadastro público', async ({ page }) => {
 
 test('super admin entra e consulta os cadastros', async ({ page }) => {
   await page.goto('/#admin')
-  await page.getByRole('button', { name: /Entrar no painel/ }).click()
+  await loginAdmin(page)
   await expect(page.getByRole('heading', { name: 'Visão geral' })).toBeVisible()
   await expect(page.getByText('Mariana Alves da Silva')).toBeVisible()
   await page.getByText('Mariana Alves da Silva').click()
@@ -63,7 +71,7 @@ test('exibe filiação, povo indígena, formações repetíveis e itinerários',
 
 test('habilita profissionais, relatórios e questionário do aluno no painel', async ({ page }) => {
   await page.goto('/#admin')
-  await page.getByRole('button', { name: /Entrar no painel/ }).click()
+  await loginAdmin(page)
 
   await page.getByRole('button', { name: /Profissionais/ }).click()
   await expect(page.getByRole('heading', { name: 'Profissionais', exact: true })).toBeVisible()
